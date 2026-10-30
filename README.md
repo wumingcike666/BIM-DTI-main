@@ -1,6 +1,6 @@
 # BIM-DTI
 
-**BIM-DTI: Drug–Target Binding Affinity Prediction with Bidirectional Multi-Path Interaction Learning**
+**BIM-DTI: Drug–Target Interaction Prediction through Bidirectional Induced Representation Modeling**
 
 This repository contains the source code and datasets for BIM-DTI, a drug–target interaction prediction model based on sequence modeling and bidirectional interaction learning.
 
