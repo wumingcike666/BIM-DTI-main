@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 
 
 class Swish(nn.Module):
@@ -16,6 +18,25 @@ class Swish(nn.Module):
             return x * self.softmax(x) + x
 
 
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=2048):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        pe = torch.zeros(max_len, d_model)  # [L, C]
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)  # [L,1]
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, L, C]
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [B, L, C]
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
+
+
 class AttentionDTA(nn.Module):
     def __init__(self, protein_MAX_LENGH=1200, protein_kernel=[4, 8, 12],
                  drug_MAX_LENGH=100, drug_kernel=[4, 6, 8],
@@ -30,17 +51,19 @@ class AttentionDTA(nn.Module):
         self.drug_kernel = drug_kernel
         self.protein_MAX_LENGH = protein_MAX_LENGH
         self.protein_kernel = protein_kernel
-
-
         self.tf_layers = tf_layers
         self.tf_heads = tf_heads
         self.tf_ffn = tf_ffn
         self.tf_dropout = tf_dropout
+        self.feature_dim = self.conv * 3  # CNN输出通道维度
 
-        self.feature_dim = self.conv * 3  
-
+        # 显式双向 MHA 要求 feature_dim 能被 head_num 整除
         assert self.feature_dim % self.head_num == 0, \
             f"feature_dim={self.feature_dim} 必须能被 head_num={self.head_num} 整除（用于显式双向MHA）"
+
+        # Transformer 要求 feature_dim 能被 tf_heads 整除
+        assert self.feature_dim % self.tf_heads == 0, \
+            f"conv*3={self.feature_dim} 必须能被 tf_heads={self.tf_heads} 整除"
 
         self.protein_embed = nn.Embedding(26, self.dim, padding_idx=0)
         self.drug_embed = nn.Embedding(65, self.dim, padding_idx=0)
@@ -63,18 +86,54 @@ class AttentionDTA(nn.Module):
             nn.ReLU(),
         )
 
+        # ===== CNN后序列增强：Transformer Encoder =====
+        self.drug_pos_encoder = PositionalEncoding(
+            d_model=self.feature_dim, dropout=self.tf_dropout, max_len=self.drug_MAX_LENGH
+        )
+        self.protein_pos_encoder = PositionalEncoding(
+            d_model=self.feature_dim, dropout=self.tf_dropout, max_len=self.protein_MAX_LENGH
+        )
+
+        drug_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.feature_dim,
+            nhead=self.tf_heads,
+            dim_feedforward=self.tf_ffn,
+            dropout=self.tf_dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+        protein_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.feature_dim,
+            nhead=self.tf_heads,
+            dim_feedforward=self.tf_ffn,
+            dropout=self.tf_dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True
+        )
+
+        self.drug_transformer = nn.TransformerEncoder(drug_encoder_layer, num_layers=self.tf_layers)
+        self.protein_transformer = nn.TransformerEncoder(protein_encoder_layer, num_layers=self.tf_layers)
+
+        self.drug_tf_norm = nn.LayerNorm(self.feature_dim)
+        self.protein_tf_norm = nn.LayerNorm(self.feature_dim)
+
         self.dropout = nn.Dropout(self.dropout_rate)
         self.relu = nn.ReLU()
         self.tanh = nn.Tanh()
         self.leaky_relu = nn.LeakyReLU()
 
+        # 去掉“再与原始特征拼接”后，token维度从 2C 变为 C
         self.fc = nn.Sequential(
             nn.Linear(self.conv * 3, self.conv * 3),
             nn.ReLU()
         )
 
+        # 保持固定4头，仅把输入维度同步改为 C
         self.self_attention = nn.MultiheadAttention(self.conv * 3, 4, batch_first=True)
 
+        # ===== 只保留显式双向交叉注意力 =====
         self.drug_to_protein_attn = nn.MultiheadAttention(
             embed_dim=self.feature_dim,
             num_heads=self.head_num,
@@ -88,6 +147,7 @@ class AttentionDTA(nn.Module):
             batch_first=True
         )
 
+        # 门控融合：控制“原始特征 vs 显式交叉注意力特征”的融合比例
         self.drug_gate = nn.Sequential(
             nn.Linear(self.feature_dim * 2, self.feature_dim),
             nn.Sigmoid()
@@ -111,6 +171,7 @@ class AttentionDTA(nn.Module):
             nn.Dropout(self.dropout_rate)
         )
 
+        # pair 变成 [B, L, 3C]，max+avg 后变成 [B, 6C]
         self.classifier = nn.Sequential(
             nn.Linear(self.conv * 6, 1024),
             nn.Dropout(self.dropout_rate),
@@ -162,13 +223,16 @@ class AttentionDTA(nn.Module):
         """
         atoms_vector: [B, C, Ld]
         amino_vector: [B, C, Lp]
-        return: iner [B, L_fused, C]
+        return: iner [B, L_fused, 3C]
         """
 
+        # ===== 0) 转成 [B, L, C] =====
         amino_vector = amino_vector.permute(0, 2, 1).contiguous()   # [B, Lp, C]
         atoms_vector = atoms_vector.permute(0, 2, 1).contiguous()   # [B, Ld, C]
 
-        drug_cross, attn_d2t = self.drug_to_protein_attn(
+        # ===== 1) 显式独立双向 MHA（受 head_num 控制） =====
+        # drug <- protein
+        drug_cross, _ = self.drug_to_protein_attn(
             query=atoms_vector,
             key=amino_vector,
             value=amino_vector,
@@ -176,7 +240,8 @@ class AttentionDTA(nn.Module):
         )   # [B, Ld, C]
         drug_cross = torch.nan_to_num(drug_cross, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        protein_cross, attn_t2d = self.protein_to_drug_attn(
+        # protein <- drug
+        protein_cross, _ = self.protein_to_drug_attn(
             query=amino_vector,
             key=atoms_vector,
             value=atoms_vector,
@@ -184,34 +249,28 @@ class AttentionDTA(nn.Module):
         )   # [B, Lp, C]
         protein_cross = torch.nan_to_num(protein_cross, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        self.last_attn_d2t = attn_d2t.detach().cpu() if attn_d2t is not None else None
-        self.last_attn_t2d = attn_t2d.detach().cpu() if attn_t2d is not None else None
-        self.last_drug_key_padding_mask = drug_key_padding_mask.detach().cpu()
-        self.last_protein_key_padding_mask = protein_key_padding_mask.detach().cpu()
-
+        # ===== 2) 原始特征 vs 显式交互，做门控融合 =====
         drug_gate = self.drug_gate(torch.cat([atoms_vector, drug_cross], dim=-1))
         drug_gate = torch.nan_to_num(drug_gate, nan=0.5, posinf=1.0, neginf=0.0)
-        self.last_drug_gate = drug_gate.detach().float().cpu()
         drug_fused = drug_gate * drug_cross + (1.0 - drug_gate) * atoms_vector
         drug_fused = self.drug_fuse_norm(drug_fused + self.drug_fuse_ffn(drug_fused))
         drug_fused = torch.nan_to_num(drug_fused, nan=0.0, posinf=1e4, neginf=-1e4)
 
         protein_gate = self.protein_gate(torch.cat([amino_vector, protein_cross], dim=-1))
         protein_gate = torch.nan_to_num(protein_gate, nan=0.5, posinf=1.0, neginf=0.0)
-        self.last_target_gate = protein_gate.detach().float().cpu()
         protein_fused = protein_gate * protein_cross + (1.0 - protein_gate) * amino_vector
         protein_fused = self.protein_fuse_norm(protein_fused + self.protein_fuse_ffn(protein_fused))
         protein_fused = torch.nan_to_num(protein_fused, nan=0.0, posinf=1e4, neginf=-1e4)
 
-
+        # ===== 3) 去掉“再与原始特征拼接” =====
         branch_tokens = torch.cat([protein_fused, drug_fused], dim=1)   # [B, Lp+Ld, C]
         branch_tokens = torch.nan_to_num(branch_tokens, nan=0.0, posinf=1e4, neginf=-1e4)
 
- 
+        # ===== 4) 线性整合 =====
         iner = self.fc(branch_tokens)   # [B, Lp+Ld, C]
         iner = torch.nan_to_num(iner, nan=0.0, posinf=1e4, neginf=-1e4)
 
-
+        # ===== 5) 自注意力再整合 =====
         fused_padding_mask = torch.cat([protein_key_padding_mask, drug_key_padding_mask], dim=1)
         iner_f, _ = self.self_attention(iner, iner, iner, key_padding_mask=fused_padding_mask)
         iner_f = torch.nan_to_num(iner_f, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -232,11 +291,36 @@ class AttentionDTA(nn.Module):
         drugConv = self.Drug_CNNs(drugembed)           # [B, C, Ld]
         proteinConv = self.Protein_CNNs(proteinembed) # [B, C, Lp]
 
+        # ===== CNN后接Transformer，增强长程依赖 =====
+        drugSeq = drugConv.permute(0, 2, 1).contiguous()       # [B, Ld, C]
+        proteinSeq = proteinConv.permute(0, 2, 1).contiguous() # [B, Lp, C]
+
+        # 位置编码
+        drugSeq = self.drug_pos_encoder(drugSeq)
+        proteinSeq = self.protein_pos_encoder(proteinSeq)
+
+        # token==0 表示 padding
         drug_raw_mask = (drug != 0).float()
         protein_raw_mask = (protein != 0).float()
 
         drug_key_padding_mask = self._build_cnn_padding_mask(drug_raw_mask, self.drug_kernel)
         protein_key_padding_mask = self._build_cnn_padding_mask(protein_raw_mask, self.protein_kernel)
+
+        drugSeq = self.drug_transformer(
+            drugSeq, src_key_padding_mask=drug_key_padding_mask
+        )
+        proteinSeq = self.protein_transformer(
+            proteinSeq, src_key_padding_mask=protein_key_padding_mask
+        )
+
+        drugSeq = self.drug_tf_norm(drugSeq)
+        proteinSeq = self.protein_tf_norm(proteinSeq)
+
+        drugSeq = torch.nan_to_num(drugSeq, nan=0.0, posinf=0.0, neginf=0.0)
+        proteinSeq = torch.nan_to_num(proteinSeq, nan=0.0, posinf=0.0, neginf=0.0)
+
+        drugConv = drugSeq.permute(0, 2, 1).contiguous()
+        proteinConv = proteinSeq.permute(0, 2, 1).contiguous()
 
         pair = self.fu_attention(
             drugConv, proteinConv, drug_raw_mask, protein_raw_mask,
@@ -248,10 +332,11 @@ class AttentionDTA(nn.Module):
             [~protein_key_padding_mask, ~drug_key_padding_mask], dim=1
         ).float()   # [B, L], 1=valid, 0=padding
 
-
+        # masked max pooling
         pair_for_max = pair.masked_fill(fused_valid_mask.unsqueeze(-1) == 0, -1e4)
         d_max_feature_a = pair_for_max.max(dim=1).values   # [B, 3C]
 
+        # masked avg pooling
         pair_for_avg = pair * fused_valid_mask.unsqueeze(-1)
         valid_count = fused_valid_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
         d_avg_feature_a = pair_for_avg.sum(dim=1) / valid_count
