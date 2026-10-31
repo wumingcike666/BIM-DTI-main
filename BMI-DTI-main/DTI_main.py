@@ -1,8 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-@Time:Created on 2020/7/05
-@author: Qichang Zhao
-"""
 
 import random
 import os
@@ -83,7 +78,7 @@ def train(model, train_data_loader, eval_data_loader, test_data_loader, args):
     criterion = get_loss_function()
     t_total = len(train_data_loader) // args.gradient_accumulation_steps * args.epochs
 
-    # 按作者风格：不在 AdamW 中使用 weight_decay
+    
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -144,7 +139,7 @@ def train(model, train_data_loader, eval_data_loader, test_data_loader, args):
         avg_train_loss = tr_loss / max(local_steps, 1)
         writer.add_scalar("train_loss", avg_train_loss, global_step)
 
-        # 作者式宽松流程：每轮都看 valid 和 test
+        
         valid_results = evaluate(model, eval_data_loader, args)
         test_results = inference(model, test_data_loader, args, save=False)
 
@@ -211,7 +206,7 @@ def evaluate(model, data_loader, args):
 
     preds_classes = np.argmax(total_preds, axis=1)
 
-    # 按作者版：AUC/AUPR 使用 raw logits[:, 1]
+   
     acc_valid = accuracy_score(total_labels, preds_classes)
     auc_valid = roc_auc_score(total_labels, total_preds[:, 1])
     aucpr_valid = average_precision_score(total_labels, total_preds[:, 1])
@@ -282,7 +277,7 @@ def inference(model, data_loader, args, state="Train", save=True):
 
     preds_classes = np.argmax(total_preds, axis=1)
 
-    # 按作者版：AUC/AUPR 使用 raw logits[:, 1]
+    
     acc_test = accuracy_score(total_labels, preds_classes)
     auc_test = roc_auc_score(total_labels, total_preds[:, 1])
     aucpr_test = average_precision_score(total_labels, total_preds[:, 1])
@@ -327,13 +322,13 @@ if __name__ == "__main__":
     parser.add_argument('--log_file', type=str, default='log.txt', help='log file')
     parser.add_argument('--model', type=str, default='AttentionDTA', help='model name')
 
-    # 保留你现有扩展参数，方便继续跑你自己的模型
+    
     parser.add_argument('--tf_layers', type=int, default=2)
     parser.add_argument('--tf_heads', type=int, default=4)
     parser.add_argument('--tf_ffn', type=int, default=256)
     parser.add_argument('--tf_dropout', type=float, default=0.1)
     parser.add_argument('--dropout_rate', type=float, default=0.1)
-    parser.add_argument('--weight_decay', type=float, default=1e-4)  # 保留参数位，但作者式协议版训练中不使用
+    parser.add_argument('--weight_decay', type=float, default=1e-4)  
 
     args = parser.parse_args()
 
@@ -372,7 +367,7 @@ if __name__ == "__main__":
         valid_size = int(0.2 * TVdataset_len)
         train_size = TVdataset_len - valid_size
 
-        # 按作者版：random_split，不额外固定 generator
+        
         train_dataset, valid_dataset = torch.utils.data.random_split(
             TVdataset, [train_size, valid_size]
         )
