@@ -147,7 +147,7 @@ class AttentionDTA(nn.Module):
             batch_first=True
         )
 
-        # 门控融合：控制“原始特征 vs 显式交叉注意力特征”的融合比例
+        
         self.drug_gate = nn.Sequential(
             nn.Linear(self.feature_dim * 2, self.feature_dim),
             nn.Sigmoid()
@@ -171,7 +171,7 @@ class AttentionDTA(nn.Module):
             nn.Dropout(self.dropout_rate)
         )
 
-        # pair 变成 [B, L, 3C]，max+avg 后变成 [B, 6C]
+        
         self.classifier = nn.Sequential(
             nn.Linear(self.conv * 6, 1024),
             nn.Dropout(self.dropout_rate),
