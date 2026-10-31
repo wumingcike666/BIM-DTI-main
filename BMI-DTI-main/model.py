@@ -55,13 +55,13 @@ class AttentionDTA(nn.Module):
         self.tf_heads = tf_heads
         self.tf_ffn = tf_ffn
         self.tf_dropout = tf_dropout
-        self.feature_dim = self.conv * 3  # CNN输出通道维度
+        self.feature_dim = self.conv * 3  
 
-        # 显式双向 MHA 要求 feature_dim 能被 head_num 整除
+        
         assert self.feature_dim % self.head_num == 0, \
             f"feature_dim={self.feature_dim} 必须能被 head_num={self.head_num} 整除（用于显式双向MHA）"
 
-        # Transformer 要求 feature_dim 能被 tf_heads 整除
+        
         assert self.feature_dim % self.tf_heads == 0, \
             f"conv*3={self.feature_dim} 必须能被 tf_heads={self.tf_heads} 整除"
 
@@ -86,7 +86,7 @@ class AttentionDTA(nn.Module):
             nn.ReLU(),
         )
 
-        # ===== CNN后序列增强：Transformer Encoder =====
+        
         self.drug_pos_encoder = PositionalEncoding(
             d_model=self.feature_dim, dropout=self.tf_dropout, max_len=self.drug_MAX_LENGH
         )
@@ -124,16 +124,16 @@ class AttentionDTA(nn.Module):
         self.tanh = nn.Tanh()
         self.leaky_relu = nn.LeakyReLU()
 
-        # 去掉“再与原始特征拼接”后，token维度从 2C 变为 C
+       
         self.fc = nn.Sequential(
             nn.Linear(self.conv * 3, self.conv * 3),
             nn.ReLU()
         )
 
-        # 保持固定4头，仅把输入维度同步改为 C
+        
         self.self_attention = nn.MultiheadAttention(self.conv * 3, 4, batch_first=True)
 
-        # ===== 只保留显式双向交叉注意力 =====
+        
         self.drug_to_protein_attn = nn.MultiheadAttention(
             embed_dim=self.feature_dim,
             num_heads=self.head_num,
@@ -226,11 +226,11 @@ class AttentionDTA(nn.Module):
         return: iner [B, L_fused, 3C]
         """
 
-        # ===== 0) 转成 [B, L, C] =====
+        
         amino_vector = amino_vector.permute(0, 2, 1).contiguous()   # [B, Lp, C]
         atoms_vector = atoms_vector.permute(0, 2, 1).contiguous()   # [B, Ld, C]
 
-        # ===== 1) 显式独立双向 MHA（受 head_num 控制） =====
+        
         # drug <- protein
         drug_cross, _ = self.drug_to_protein_attn(
             query=atoms_vector,
@@ -249,7 +249,7 @@ class AttentionDTA(nn.Module):
         )   # [B, Lp, C]
         protein_cross = torch.nan_to_num(protein_cross, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # ===== 2) 原始特征 vs 显式交互，做门控融合 =====
+        
         drug_gate = self.drug_gate(torch.cat([atoms_vector, drug_cross], dim=-1))
         drug_gate = torch.nan_to_num(drug_gate, nan=0.5, posinf=1.0, neginf=0.0)
         drug_fused = drug_gate * drug_cross + (1.0 - drug_gate) * atoms_vector
@@ -262,15 +262,15 @@ class AttentionDTA(nn.Module):
         protein_fused = self.protein_fuse_norm(protein_fused + self.protein_fuse_ffn(protein_fused))
         protein_fused = torch.nan_to_num(protein_fused, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # ===== 3) 去掉“再与原始特征拼接” =====
+       
         branch_tokens = torch.cat([protein_fused, drug_fused], dim=1)   # [B, Lp+Ld, C]
         branch_tokens = torch.nan_to_num(branch_tokens, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # ===== 4) 线性整合 =====
+        
         iner = self.fc(branch_tokens)   # [B, Lp+Ld, C]
         iner = torch.nan_to_num(iner, nan=0.0, posinf=1e4, neginf=-1e4)
 
-        # ===== 5) 自注意力再整合 =====
+        
         fused_padding_mask = torch.cat([protein_key_padding_mask, drug_key_padding_mask], dim=1)
         iner_f, _ = self.self_attention(iner, iner, iner, key_padding_mask=fused_padding_mask)
         iner_f = torch.nan_to_num(iner_f, nan=0.0, posinf=1e4, neginf=-1e4)
@@ -291,15 +291,15 @@ class AttentionDTA(nn.Module):
         drugConv = self.Drug_CNNs(drugembed)           # [B, C, Ld]
         proteinConv = self.Protein_CNNs(proteinembed) # [B, C, Lp]
 
-        # ===== CNN后接Transformer，增强长程依赖 =====
+        
         drugSeq = drugConv.permute(0, 2, 1).contiguous()       # [B, Ld, C]
         proteinSeq = proteinConv.permute(0, 2, 1).contiguous() # [B, Lp, C]
 
-        # 位置编码
+        
         drugSeq = self.drug_pos_encoder(drugSeq)
         proteinSeq = self.protein_pos_encoder(proteinSeq)
 
-        # token==0 表示 padding
+        
         drug_raw_mask = (drug != 0).float()
         protein_raw_mask = (protein != 0).float()
 
